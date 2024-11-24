@@ -9,6 +9,7 @@ from training_utils import pretrain_tokenize_function, DataCollatorForDynamicPad
 def main():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    training_args.remove_unused_columns = False  # 추가된 부분
 
     print(model_args)
     print(data_args)
@@ -42,7 +43,7 @@ def main():
     model = ICAE(model_args, training_args, lora_config)
     MEM_TOKENS = list(range(model.vocab_size, model.vocab_size + memory_size))
 
-    train_dataset = train_dataset.map(pretrain_tokenize_function, batched=True, batch_size=1, fn_kwargs={"model": model, "mem": MEM_TOKENS, "lm_ratio": training_args.lm_ratio})
+    train_dataset = train_dataset.map(pretrain_tokenize_function, batched=True, batch_size=4, fn_kwargs={"model": model, "mem": MEM_TOKENS, "lm_ratio": training_args.lm_ratio})
     eval_dataset = eval_dataset.map(pretrain_tokenize_function, batched=True, fn_kwargs={"model": model, "mem": MEM_TOKENS})   # don't add lm in the dev set.
 
     data_collator = DataCollatorForDynamicPadding(model.pad_token_id)

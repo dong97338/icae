@@ -133,7 +133,7 @@ class ICAE(torch.nn.Module):
         self.memory_token_embed = nn.Embedding(self.mem_size + 3, self.dim, padding_idx=None)
         self.loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, use_fast=False)
-        self.register_buffer("append_sequence", torch.arange(self.vocab_size, self.vocab_size + self.mem_size, dtype=torch.long).unsqueeze(0))
+        self.append_sequence = torch.arange(self.vocab_size, self.vocab_size + self.mem_size, dtype=torch.long, device=device).unsqueeze(0)    # mem tokens
         
         if self.training:
             self.init()
@@ -166,46 +166,61 @@ class ICAE(torch.nn.Module):
         prompt_answer_ids: torch.LongTensor = None,
         labels: Optional[torch.LongTensor] = None,
     ):
-        # encoder part
+        # Encoder part
         batch_size = input_ids.size(0)
         total_length = input_ids.size(1)
         num_segments = self.compute_num_segments(total_length)
         segment_length = math.ceil(total_length / num_segments)
         
-        prompt_answer_embs = self.icae.get_base_model().model.embed_tokens(prompt_answer_ids)
+        prompt_answer_embs = self.icae.get_base_model().model.embed_tokens(prompt_answer_ids)  # [batch_size, prompt_length, dim]
         max_compressed_length = num_segments * self.mem_size
-        
-        # compress_outputs를 [batch_size, max_compressed_length, self.dim] 크기로 수정
-        compress_outputs = torch.zeros((batch_size, max_compressed_length, self.dim)).to(prompt_answer_embs.device)
+        # [batch_size, max_compressed_length, dim]로 초기화
+        compress_outputs = torch.zeros((batch_size, max_compressed_length, self.dim), dtype=prompt_answer_embs.dtype, device=prompt_answer_embs.device)
+
         
         for segment_idx in range(num_segments):
-            
             start_idx = segment_idx * segment_length
             end_idx = min((segment_idx + 1) * segment_length, total_length)
             segment_input_ids = input_ids[:, start_idx:end_idx]
-            segment_input_ids = torch.cat([segment_input_ids, self.append_sequence.expand(batch_size, -1)], dim=1)
-            mem_flag = segment_input_ids >= self.vocab_size
-
-            segment_input_embedding = self.icae.get_base_model().model.embed_tokens(segment_input_ids)
-            segment_input_embedding[mem_flag] = self.memory_token_embed(segment_input_ids[mem_flag] - self.vocab_size).to(segment_input_embedding)
             
-            # compress the current segment
+            # Expand self.append_sequence to match batch size
+            append_sequence = self.append_sequence.expand(batch_size, -1)  # [batch_size, mem_size]
+            segment_input_ids = torch.cat([segment_input_ids, append_sequence], dim=1)  # [batch_size, segment_length + mem_size]
+            
+            mem_flag = segment_input_ids >= self.vocab_size  # [batch_size, segment_length + mem_size]
+            segment_input_embedding = self.icae.get_base_model().model.embed_tokens(segment_input_ids)  # [batch_size, seq_len, dim]
+            segment_input_embedding[mem_flag] = self.memory_token_embed(
+                segment_input_ids[mem_flag] - self.vocab_size
+            ).to(segment_input_embedding)
+            
+            # Compress the current segment
             segment_compress_outputs = self.icae(inputs_embeds=segment_input_embedding, output_hidden_states=True)
-            segment_compress_outputs = segment_compress_outputs.hidden_states[-1]
-
-            # 각 배치에 대해 메모리 토큰 할당
-            for b in range(batch_size):
-                compress_outputs[b, segment_idx*self.mem_size : (segment_idx+1)*self.mem_size, :] = segment_compress_outputs[b][mem_flag[b]]
+            segment_compress_outputs = segment_compress_outputs.hidden_states[-1]  # [batch_size, seq_len, dim]
+            
+            # Collect memory tokens
+            for i in range(batch_size):
+                # 각 배치의 메모리 토큰 위치
+                mem_positions = mem_flag[i].nonzero(as_tuple=False).squeeze(1)  # [mem_size]
+                # 해당 위치의 임베딩을 compress_outputs에 할당
+                compress_outputs[i, segment_idx * self.mem_size : (segment_idx + 1) * self.mem_size, :] = segment_compress_outputs[i, mem_positions, :]
             
             del segment_input_ids, segment_input_embedding
             torch.cuda.empty_cache()
         
         # decoder part
-        decoder_mem_flag = (prompt_answer_ids >= self.vocab_size) & (prompt_answer_ids < self.vocab_size + self.mem_size)   # only mem tokens
-
-        prompt_answer_embs[decoder_mem_flag] = compress_outputs.view(-1, self.dim)  # reshape if 필요
+        decoder_mem_flag = (prompt_answer_ids >= self.vocab_size) & (prompt_answer_ids < self.vocab_size + self.mem_size)  # [batch_size, prompt_length]
+        
+        # Assign compress_outputs to prompt_answer_embs where decoder_mem_flag is True
+        for i in range(batch_size):
+            # Number of mem tokens to assign per batch
+            num_mem_tokens = decoder_mem_flag[i].sum().item()
+            # Ensure compress_outputs has enough mem tokens
+            assert max_compressed_length >= num_mem_tokens, f"Not enough mem tokens to assign for batch {i}"
+            # Assign the first `num_mem_tokens` from compress_outputs for this batch
+            prompt_answer_embs[i, decoder_mem_flag[i]] = compress_outputs[i, :num_mem_tokens, :]
+        
         special_prompt = prompt_answer_ids >= self.vocab_size_with_mem
-        prompt_answer_embs[special_prompt] = self.memory_token_embed(prompt_answer_ids[special_prompt] - self.vocab_size).to(prompt_answer_embs)    # replace special token's embedding from self.memory_token_embed
+        prompt_answer_embs[special_prompt] = self.memory_token_embed(prompt_answer_ids[special_prompt] - self.vocab_size).to(prompt_answer_embs)
         
         if self.training:   # has an independent decoder
             decoder_outputs = self.decoder(inputs_embeds=prompt_answer_embs, output_hidden_states=True)
@@ -213,10 +228,9 @@ class ICAE(torch.nn.Module):
             with self.icae.disable_adapter():   # no independent decoder; use self.icae
                 decoder_outputs = self.icae(inputs_embeds=prompt_answer_embs, output_hidden_states=True)
 
-
         logits = decoder_outputs.logits
-        effective_logits = logits[:,:-1,:].reshape(-1, logits.size(-1))
-        target_ids = labels[:,1:].reshape(-1)
+        effective_logits = logits[:, :-1, :].reshape(-1, logits.size(-1))
+        target_ids = labels[:, 1:].reshape(-1)
         loss = self.loss_fct(effective_logits, target_ids)
         return {"loss": loss, "logits": logits}
     

@@ -30,19 +30,19 @@ def main():
     
     memory_size = training_args.fixed_mem_size
 
-    train_file = "/path/to/train/file"
-    eval_file = "/path/to/dev/file"
+    train_file = "text_only.jsonl"
+    eval_file = "text_eval.jsonl"
 
     print("Loading dataset...")
 
-    dataset = load_dataset("json", data_files={"train": train_file, "eval": eval_file}, streaming=True) # streaming can be removed if the dataset is not very large.
+    dataset = load_dataset("json", data_files={"train": train_file, "eval": eval_file}, streaming=False) # streaming can be removed if the dataset is not very large.
     train_dataset = dataset["train"]
     eval_dataset = dataset["eval"]
 
     model = ICAE(model_args, training_args, lora_config)
     MEM_TOKENS = list(range(model.vocab_size, model.vocab_size + memory_size))
 
-    train_dataset = train_dataset.map(pretrain_tokenize_function, batched=True, batch_size=64, fn_kwargs={"model": model, "mem": MEM_TOKENS, "lm_ratio": training_args.lm_ratio})
+    train_dataset = train_dataset.map(pretrain_tokenize_function, batched=True, batch_size=1, fn_kwargs={"model": model, "mem": MEM_TOKENS, "lm_ratio": training_args.lm_ratio})
     eval_dataset = eval_dataset.map(pretrain_tokenize_function, batched=True, fn_kwargs={"model": model, "mem": MEM_TOKENS})   # don't add lm in the dev set.
 
     data_collator = DataCollatorForDynamicPadding(model.pad_token_id)

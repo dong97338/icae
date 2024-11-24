@@ -133,7 +133,7 @@ class ICAE(torch.nn.Module):
         self.memory_token_embed = nn.Embedding(self.mem_size + 3, self.dim, padding_idx=None)
         self.loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, use_fast=False)
-        self.append_sequence = torch.arange(self.vocab_size, self.vocab_size + self.mem_size, dtype=torch.long, device=device).unsqueeze(0)    # mem tokens
+        self.register_buffer("append_sequence", torch.arange(self.vocab_size, self.vocab_size + self.mem_size, dtype=torch.long).unsqueeze(0))
         
         if self.training:
             self.init()
@@ -174,37 +174,40 @@ class ICAE(torch.nn.Module):
         
         prompt_answer_embs = self.icae.get_base_model().model.embed_tokens(prompt_answer_ids)
         max_compressed_length = num_segments * self.mem_size
-        compress_outputs = torch.zeros((max_compressed_length, self.dim)).to(prompt_answer_embs)
+        
+        # compress_outputs를 [batch_size, max_compressed_length, self.dim] 크기로 수정
+        compress_outputs = torch.zeros((batch_size, max_compressed_length, self.dim)).to(prompt_answer_embs.device)
         
         for segment_idx in range(num_segments):
             
             start_idx = segment_idx * segment_length
             end_idx = min((segment_idx + 1) * segment_length, total_length)
             segment_input_ids = input_ids[:, start_idx:end_idx]
-            segment_input_ids = torch.cat([segment_input_ids, self.append_sequence], dim=1)
+            segment_input_ids = torch.cat([segment_input_ids, self.append_sequence.expand(batch_size, -1)], dim=1)
             mem_flag = segment_input_ids >= self.vocab_size
 
             segment_input_embedding = self.icae.get_base_model().model.embed_tokens(segment_input_ids)
             segment_input_embedding[mem_flag] = self.memory_token_embed(segment_input_ids[mem_flag] - self.vocab_size).to(segment_input_embedding)
-
+            
             # compress the current segment
             segment_compress_outputs = self.icae(inputs_embeds=segment_input_embedding, output_hidden_states=True)
             segment_compress_outputs = segment_compress_outputs.hidden_states[-1]
 
-            # collect memory tokens
-            compress_outputs[segment_idx*self.mem_size: self.mem_size*(segment_idx+1)] = segment_compress_outputs[mem_flag]
+            # 각 배치에 대해 메모리 토큰 할당
+            for b in range(batch_size):
+                compress_outputs[b, segment_idx*self.mem_size : (segment_idx+1)*self.mem_size, :] = segment_compress_outputs[b][mem_flag[b]]
             
             del segment_input_ids, segment_input_embedding
             torch.cuda.empty_cache()
-            
+        
         # decoder part
         decoder_mem_flag = (prompt_answer_ids >= self.vocab_size) & (prompt_answer_ids < self.vocab_size + self.mem_size)   # only mem tokens
 
-        prompt_answer_embs[decoder_mem_flag] = compress_outputs  # replace memory slots
+        prompt_answer_embs[decoder_mem_flag] = compress_outputs.view(-1, self.dim)  # reshape if 필요
         special_prompt = prompt_answer_ids >= self.vocab_size_with_mem
         prompt_answer_embs[special_prompt] = self.memory_token_embed(prompt_answer_ids[special_prompt] - self.vocab_size).to(prompt_answer_embs)    # replace special token's embedding from self.memory_token_embed
         
-        if self.training:   # has an independent se.f.decoder
+        if self.training:   # has an independent decoder
             decoder_outputs = self.decoder(inputs_embeds=prompt_answer_embs, output_hidden_states=True)
         else:
             with self.icae.disable_adapter():   # no independent decoder; use self.icae

@@ -33,14 +33,17 @@ model.load_state_dict(state_dict, strict=False) # only load lora and memory toke
 
 model = model.to(device)
 
-lines = ["I don't have a favorite condiment as I don't consume food or condiments. However, I can tell you that many people enjoy condiments like ketchup, mayonnaise, mustard, soy sauce, hot sauce, and ranch dressing, among others. The favorite condiment can vary greatly from person to person, depending on their taste preferences and cultural influences."]
+file_path = "./test.jsonl"
+lines = None
+with open(file_path, "r") as f:
+    lines = f.readlines()
 
 # Prepare the model for evaluation
 model.eval()
 with torch.no_grad():
-    with open("tmp.out", "w") as f:
+    with open("tmp4.out", "w") as f:
 
-        for line in tqdm(lines):
+        for line in tqdm(lines[:1]):
             # Tokenize input text
             tokenized_text = model.tokenizer(line, truncation=True,
                                           max_length=5120, padding=False,
@@ -78,7 +81,7 @@ with torch.no_grad():
                 output = model.icae.get_base_model().model.embed_tokens(next_token_id).unsqueeze(1).to(device)
                 generate_text.append(next_token_id.item())
 
-            generated_text = model.tokenizer.decode(generate_text)
+            generated_text = model.tokenizer.decode(generate_text, skip_special_tokens=True, clean_up_tokenization_spaces=True) # skip_special_tokens=True, clean_up_tokenization_spaces=True 이거 원래는 빠져있었음
 
             # Structure output data
             output_ = {

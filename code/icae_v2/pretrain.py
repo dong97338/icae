@@ -31,8 +31,8 @@ def main():
     
     memory_size = training_args.fixed_mem_size
 
-    train_file = "text_only.jsonl"
-    eval_file = "text_eval.jsonl"
+    train_file = "train.jsonl"
+    eval_file = "eval.jsonl"
 
     print("Loading dataset...")
 

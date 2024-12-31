@@ -1,0 +1,11 @@
+# 모든 파일 및 폴더 제외
+*
+
+# 이름이 v로 시작하는 폴더 화이트리스트 추가
+!.gitignore
+!code/
+!code/icae_v2/
+!code/icae_v2/v*/
+!code/icae_v2/v*/**
+
+*.pyc
